@@ -576,12 +576,10 @@ def go_chip(): st.session_state.page = 'chip'
 @st.cache_data
 def load_data():
     try:
-        # Lineups
         df_l = pd.read_csv(io.StringIO(CSV_LINEUPS))
         df_l = df_l.iloc[:, [0, 1, 3, 4, 5, 6, 7, 8, 9]]
         df_l.columns = ['Team', 'Player', '1', '2', '3', '4', '5', '6', '7']
         
-        # Registrations
         df_r = pd.read_csv(io.StringIO(CSV_REGISTRATIONS))
         df_r['FPL_ID'] = df_r['Profile'].apply(lambda x: int(re.search(r'entry/(\d+)', str(x)).group(1)) if re.search(r'entry/(\d+)', str(x)) else None)
         
@@ -648,7 +646,7 @@ fpl_elements, fpl_teams = get_fpl_elements()
 teams_list = sorted(df['Team'].unique().tolist())
 
 # ==========================================
-# PAGE: HOME (SPLASH SCREEN)
+# PAGE: HOME
 # ==========================================
 if st.session_state.page == 'home':
     st.title("🏆 QFPL Hub")
@@ -670,7 +668,7 @@ if st.session_state.page == 'home':
         st.button("Open Chip Tool", on_click=go_chip, use_container_width=True)
 
 # ==========================================
-# PAGE: DIFFERENTIAL CALCULATOR
+# PAGE: DIFFERENTIALS
 # ==========================================
 elif st.session_state.page == 'diff':
     st.button("🏠 Home", on_click=go_home)
@@ -704,7 +702,6 @@ elif st.session_state.page == 'diff':
                     
                     def get_h(tm, s, e):
                         h = {}
-                        # Safe string conversion for filtering
                         mask = (df['Team'] == tm) & (df[phase].astype(str).str.upper().isin(['S', 'C']))
                         ros = df[mask]
                         tot = len(ros)
@@ -800,14 +797,13 @@ elif st.session_state.page == 'chip':
         phase_ranges = {'1': (1,5), '2': (6,10), '3': (12,16), '4': (17,21), '5': (23,27), '6': (28,32), '7': (34,38)}
         start, end = phase_ranges[curr_phase]
         
-        # Regex search for team name to catch "Fulham" vs "Fulham QFC"
         phase_usage = df_used_chips[
             (df_used_chips['Team'].str.contains(team, case=False)) & 
             (df_used_chips['Status'] == 'Valid') & 
             (df_used_chips['Chip'] != 'Red Hot Form')
         ].copy()
         
-        # Double backslash for regex digit
+        # Use raw string r'' for regex pattern
         phase_usage['GW_Int'] = phase_usage['GW'].str.extract(r'(\d+)').astype(int)
         chips_used_in_phase = phase_usage[(phase_usage['GW_Int'] >= start) & (phase_usage['GW_Int'] <= end)].shape[0]
 
@@ -824,17 +820,14 @@ elif st.session_state.page == 'chip':
         return not matches.empty
 
     for c in chips:
-        # 1. Lifetime check
         if c['name'] != "Red Hot Form" and is_used_season(c['name']):
             results.append({"Chip": c['name'], "Status": "Played", "Reason": "Already used this season", "_color": "grey"})
             continue
         
-        # 2. Phase Limit
         if c['name'] != "Red Hot Form" and phase_limit_reached:
             results.append({"Chip": c['name'], "Status": "Unavailable", "Reason": f"Phase Limit Reached ({chips_used_in_phase}/2 chips used)", "_color": "red"})
             continue
 
-        # 3. Logic
         status, reason, color = "Available", "Ready", "green"
         
         if c['type'] == "form":
@@ -881,3 +874,7 @@ elif st.session_state.page == 'chip':
         df_chips_disp.style.apply(style_chips, axis=1).hide(subset=['_color'], axis='columns'),
         use_container_width=True,
         hide_index=True
+    )
+
+    st.divider()
+    st.link_button("🍟 Play a Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform?usp=header", type="primary")
