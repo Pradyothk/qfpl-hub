@@ -650,7 +650,7 @@ teams_list = sorted(df['Team'].unique().tolist())
 # ==========================================
 if st.session_state.page == 'home':
     st.title("🏆 QFPL Hub")
-    st.markdown("### Your companion for the Quarterly Fantasy Premier League")
+    st.markdown("### Your companion for the Quatret Fantasy Premier League")
     st.divider()
     
     c1, c2, c3 = st.columns(3)
