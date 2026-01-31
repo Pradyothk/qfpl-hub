@@ -27,22 +27,16 @@ SHEET_URLS = {
 
 @st.cache_data(ttl=600)
 def fetch_csv(url, key_col=None):
-    """Fetches CSV data and automatically finds the header row."""
     try:
         response = requests.get(url)
         response.raise_for_status()
         content = response.content.decode('utf-8')
-        
-        # 1. Try reading normally
         df = pd.read_csv(io.StringIO(content))
         
-        # 2. Smart Header Search
         if key_col:
-            # Normalize cols to lowercase for search
             cols_lower = [str(c).lower() for c in df.columns]
             if key_col.lower() not in cols_lower:
                 lines = content.splitlines()
-                # Check first 50 lines for the key column
                 for i, line in enumerate(lines[:50]): 
                     if key_col.lower() in line.lower():
                         df = pd.read_csv(io.StringIO(content), header=i)
@@ -57,7 +51,6 @@ def load_data_bundle():
     # 1. Lineups
     df_l = fetch_csv(SHEET_URLS["lineups"], "PLAYER")
     if not df_l.empty:
-        # Parse Lineups Columns
         p_idx = -1
         for i, c in enumerate(df_l.columns):
             if str(c).strip().upper() == "PLAYER":
@@ -79,12 +72,10 @@ def load_data_bundle():
     if not df_l.empty and not df_r.empty:
         df_main = pd.merge(df_l, df_r[['Player', 'FPL_ID']], on='Player', how='left')
 
-    # 3. Chips & Fixtures
+    # 3. Chips Data
     df_fix = fetch_csv(SHEET_URLS["fixtures"], "ShortName")
-    
     df_chips = fetch_csv(SHEET_URLS["chips"], "Chip Played")
     if not df_chips.empty:
-        # Standardize Chip Columns
         df_chips.columns = [c.strip().replace(':', '') for c in df_chips.columns]
         
         cols = df_chips.columns
@@ -92,37 +83,18 @@ def load_data_bundle():
         c_gw = next((c for c in cols if "GW" in c or "Gameweek" in c), None)
         
         if c_team:
-            # Clean Team Name: "Fulham QFC" -> "Fulham"
             df_chips['CleanTeam'] = df_chips[c_team].astype(str).str.replace(' QFC', '', regex=False).str.strip()
         
         if c_gw:
-            # Clean GW: "GW06" -> 6
             df_chips['GW_Int'] = df_chips[c_gw].astype(str).str.extract(r'(\d+)').astype(float)
 
-    # 4. Form (ROBUST LOADING)
-    # The 'FORM' table is tricky. We read the raw text and find the exact row 
-    # that has "Team", "1", and "2" to identify the real header.
-    df_form = pd.DataFrame(columns=['Team']) # Init with Team column to prevent KeyError
-    try:
-        response = requests.get(SHEET_URLS["scoring"])
-        response.raise_for_status()
-        content = response.content.decode('utf-8')
-        
-        lines = content.splitlines()
-        header_row = None
-        for i, line in enumerate(lines):
-            # Look for the row containing "Team" and Gameweek numbers
-            if "Team" in line and ",1," in line and ",2," in line:
-                header_row = i
-                break
-        
-        if header_row is not None:
-            df_score = pd.read_csv(io.StringIO(content), header=header_row)
-            if 'Team' in df_score.columns:
-                cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
-                df_form = df_score[cols].copy()
-    except:
-        pass
+    # 4. Form
+    df_score = fetch_csv(SHEET_URLS["scoring"], "FORM")
+    df_form = pd.DataFrame()
+    if not df_score.empty:
+        cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
+        if 'Team' in df_score.columns:
+            df_form = df_score[cols].copy()
 
     return df_main, df_form, df_fix, df_chips
 
@@ -166,7 +138,7 @@ def get_fixture_raw(team_code, gw, df_fix):
     if row.empty: return None
     col = f"GW{gw}"
     if col not in row.columns: return None
-    return str(row[col].values[0]) # Returns raw string (e.g. 'che' or 'CHE')
+    return str(row[col].values[0])
 
 # --- APP START ---
 
@@ -175,7 +147,7 @@ with st.spinner("Connecting to live QFPL data..."):
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
 if df.empty:
-    st.error("Data load failed. Please check the Google Sheet Links.")
+    st.error("Data load failed.")
     st.stop()
 
 teams_list = sorted([t for t in df['Team'].dropna().unique().tolist() if len(str(t)) > 1])
@@ -260,7 +232,12 @@ elif st.session_state.page == 'diff':
                     if not res: st.success("Teams are flat!")
                     else:
                         rdf = pd.DataFrame(res).sort_values(by='Net', key=abs, ascending=False)
-                        st.dataframe(rdf.style.map(lambda v: f'background-color: {"#d1e7dd" if v>0 else "#f8d7da" if v<0 else ""}; color: black', subset=['Net']), use_container_width=True, hide_index=True)
+                        # Dark Mode Friendly Coloring: Text color instead of Background
+                        def style_net(val):
+                            if val > 0: return 'color: #09AB3B; font-weight: bold' # Green
+                            if val < 0: return 'color: #FF4B4B; font-weight: bold' # Red
+                            return ''
+                        st.dataframe(rdf.style.map(style_net, subset=['Net']).hide(axis='index'), use_container_width=True)
 
 # ==========================================
 # PAGE: LINEUP HELPER
@@ -297,8 +274,20 @@ elif st.session_state.page == 'help':
         df_out = pd.DataFrame(data).sort_values(by=['_sort', 'Player'])
         if any(df_out['_sort']==0): st.error("🚨 Must Start violations found!")
         
+        # Dark Mode Friendly: Color text
+        def style_lineup(row):
+            styles = []
+            for col in row.index:
+                if row['_sort'] == 0: # Must Start
+                    styles.append('color: #FF4B4B; font-weight: bold')
+                elif col == "Captaincy" and row['Captaincy'] == "Used":
+                    styles.append('color: #FFA500; font-weight: bold') # Orange
+                else:
+                    styles.append('')
+            return styles
+
         st.dataframe(
-            df_out.style.apply(lambda x: ['background-color: #f8d7da; font-weight: bold']*len(x) if x['_sort']==0 else ['background-color: #fff3cd']*len(x) if x['Captaincy']=="Used" else ['']*len(x), axis=1).hide(subset=['_sort'], axis='columns'),
+            df_out.style.apply(style_lineup, axis=1).hide(subset=['_sort'], axis='columns'),
             use_container_width=True, hide_index=True
         )
     st.link_button("🚀 Submit", "https://docs.google.com/forms/d/e/1FAIpQLSfIPWcBe5LpLmI8dq5Jqxvw2ug9_9d2Ha9RIyREMEiBbNmyzQ/viewform", type="primary")
@@ -314,12 +303,12 @@ elif st.session_state.page == 'chip':
     with c1: team = st.selectbox("Team", teams_list)
     with c2: next_gw = st.number_input("Upcoming Gameweek", 1, 38, current_gw+1)
 
-    # 1. Identify Columns
+    # 1. Columns
     cols = df_used_chips.columns
     c_chip = next((c for c in cols if "Chip" in c), None)
     c_status = next((c for c in cols if "Status" in c), None)
     
-    # 2. Phase Limits
+    # 2. Phase Limit
     curr_phase = get_phase(next_gw)
     chips_used_in_phase = 0
     if curr_phase and not df_used_chips.empty:
@@ -337,20 +326,19 @@ elif st.session_state.page == 'chip':
 
     phase_limit_reached = (chips_used_in_phase >= 2)
     
-    # 3. Full Team Name Logic
+    # 3. Mappers
     full_team = team
     if not df_fix.empty:
         mapper = dict(zip(df_fix['ShortName'], df_fix['Team']))
         full_team = mapper.get(team, team)
 
-    # 4. Chip Analysis
+    # 4. Logic
     chips_list = ["Red Hot Form", "Stay Humble", "Travelling Support", "Fox in the Box", "Bought the Ref", "Man Mark", "Park the Bus"]
     res = []
     
     for c_name in chips_list:
         is_rhf = (c_name == "Red Hot Form")
         
-        # A. Check Usage
         used = False
         last_rhf_gw = 0
         try:
@@ -366,27 +354,23 @@ elif st.session_state.page == 'chip':
 
         avail = "Yes"
         can_play = "Yes"
-        comment = "Ready to play."
+        comment = "Ready."
         color = "green"
 
-        # Rule 1: Lifetime (Except RHF)
         if not is_rhf and used:
             res.append({"Chip Name": c_name, "Availability": "No", "Can be Played?": "No", "Comments": "Already played.", "_c": "grey"})
             continue
         
-        # Rule 2: Phase Limit (Except RHF)
-        elif not is_rhf and phase_limit_reached:
+        if not is_rhf and phase_limit_reached:
             res.append({"Chip Name": c_name, "Availability": "Yes", "Can be Played?": "No", "Comments": f"Phase limit ({chips_used_in_phase}/2 used).", "_c": "red"})
             continue
 
-        # Rule 3: Specific Logic
         if is_rhf:
             gap = next_gw - last_rhf_gw
             if gap <= 4:
                 avail = "No"; can_play = "No"; comment = f"Played in GW{int(last_rhf_gw)}. Reset gap {gap}/5."; color = "red"
             else:
                 try:
-                    if df_form.empty: raise ValueError("Empty")
                     t_row = df_form[df_form['Team'] == full_team]
                     if not t_row.empty:
                         last_4 = []
@@ -397,9 +381,8 @@ elif st.session_state.page == 'chip':
                         if last_4 != ['W']*4:
                             can_play = "No"; comment = f"Need 4 Wins. Form: {last_4}"; color = "red"
                     else:
-                        can_play = "No"; comment = "Form data missing."; color = "red"
-                except:
-                    can_play = "No"; comment = "Form data unavailable."; color = "red"
+                        can_play = "No"; comment = "Form unavailable."; color = "red"
+                except: pass
 
         elif c_name == "Stay Humble":
             try:
@@ -420,7 +403,7 @@ elif st.session_state.page == 'chip':
             except: pass
         
         elif c_name == "Travelling Support":
-            # Must be Away (lowercase in fixtures)
+            # Away = Lowercase fixture code
             raw_fix = get_fixture_raw(team, next_gw, df_fix)
             if raw_fix and raw_fix.isupper():
                 can_play = "No"; comment = f"Home game vs {raw_fix}. Must be Away."; color = "red"
@@ -428,9 +411,20 @@ elif st.session_state.page == 'chip':
         res.append({"Chip Name": c_name, "Availability": avail, "Can be Played?": can_play, "Comments": comment, "_c": color})
 
     rdf = pd.DataFrame(res)
+    
+    # Dark Mode Friendly Style: Text Color
+    def style_chip_row(row):
+        styles = []
+        c = row['_c']
+        color_css = ''
+        if c == 'green': color_css = 'color: #09AB3B; font-weight: bold'
+        elif c == 'red': color_css = 'color: #FF4B4B; font-weight: bold'
+        elif c == 'grey': color_css = 'color: #808495'
+        
+        return [color_css] * len(row)
+
     st.dataframe(
-        rdf.style.apply(lambda x: [f'background-color: {"#d1e7dd" if x["_c"]=="green" else "#f8d7da" if x["_c"]=="red" else "#e2e3e5"}; color: black']*len(x), axis=1)
-        .hide(subset=['_c'], axis='columns'),
+        rdf.style.apply(style_chip_row, axis=1).hide(subset=['_c'], axis='columns'),
         use_container_width=True, hide_index=True
     )
     
