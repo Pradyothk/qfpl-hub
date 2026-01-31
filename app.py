@@ -32,13 +32,10 @@ def fetch_csv(url, key_col=None):
         response = requests.get(url)
         response.raise_for_status()
         content = response.content.decode('utf-8')
-        
-        # 1. Try reading normally
         df = pd.read_csv(io.StringIO(content))
         
-        # 2. Smart Header Search
+        # Smart Header Search
         if key_col:
-            # Normalize cols to lowercase for search
             cols_lower = [str(c).lower() for c in df.columns]
             if key_col.lower() not in cols_lower:
                 lines = content.splitlines()
@@ -53,64 +50,51 @@ def fetch_csv(url, key_col=None):
 
 @st.cache_data(ttl=600)
 def load_data_bundle():
-    # 1. Lineups (Look for 'PLAYER' column)
+    # 1. Lineups
     df_l = fetch_csv(SHEET_URLS["lineups"], "PLAYER")
-    
-    # --- FIX FOR "x" IN DROPDOWN ---
     if not df_l.empty:
-        # Find the column index of "PLAYER"
-        # We assume the structure is: [Empty?, TEAM, PLAYER, TEAM, 1, 2, 3...]
-        player_col_idx = -1
-        for i, col in enumerate(df_l.columns):
-            if str(col).strip().upper() == "PLAYER":
-                player_col_idx = i
-                break
+        # Find "PLAYER" column to anchor
+        p_idx = -1
+        for i, c in enumerate(df_l.columns):
+            if str(c).strip().upper() == "PLAYER":
+                p_idx = i; break
         
-        if player_col_idx != -1:
-            # Team is 1 left of Player
-            # Phases start 2 right of Player (skipping the duplicate Team col)
-            idx_team = player_col_idx - 1
-            idx_player = player_col_idx
-            idx_phases = list(range(player_col_idx + 2, player_col_idx + 9)) # 7 phases
-            
-            target_indices = [idx_team, idx_player] + idx_phases
-            
-            # Safe slice
+        if p_idx != -1:
+            # Slice dynamically: Team is -1, Phases are +2 to +8
+            indices = [p_idx-1, p_idx] + list(range(p_idx+2, p_idx+9))
             try:
-                df_l = df_l.iloc[:, target_indices]
+                df_l = df_l.iloc[:, indices]
                 df_l.columns = ['Team', 'Player', '1', '2', '3', '4', '5', '6', '7']
-            except:
-                st.error("Could not parse Lineups columns automatically. Check sheet structure.")
-        else:
-            # Fallback if we can't find "PLAYER" header logic
-            pass
+            except: pass
 
-    # 2. Registrations (Look for 'Profile')
+    # 2. Registrations
     df_r = fetch_csv(SHEET_URLS["registrations"], "Profile")
     if 'Profile' in df_r.columns:
         df_r['FPL_ID'] = df_r['Profile'].apply(lambda x: int(re.search(r'entry/(\d+)', str(x)).group(1)) if re.search(r'entry/(\d+)', str(x)) else None)
 
-    # Merge Main Data
+    # Merge
     df_main = pd.DataFrame()
     if not df_l.empty and not df_r.empty:
         df_main = pd.merge(df_l, df_r[['Player', 'FPL_ID']], on='Player', how='left')
 
-    # 3. Fixtures (Look for 'ShortName')
+    # 3. Chips Data
     df_fix = fetch_csv(SHEET_URLS["fixtures"], "ShortName")
-    
-    # 4. Chips (Look for 'Chip Played')
     df_chips = fetch_csv(SHEET_URLS["chips"], "Chip Played")
     if not df_chips.empty:
-        # Normalize columns (strip spaces, remove colons)
+        # Normalize columns: remove ':', strip space
         df_chips.columns = [c.strip().replace(':', '') for c in df_chips.columns]
+        # Normalize Team Names in Chips: "Fulham QFC" -> "Fulham"
+        # We assume the first column is 'Your QFC'
+        col_team = df_chips.columns[0]
+        df_chips[col_team] = df_chips[col_team].astype(str).str.replace(' QFC', '', regex=False).str.strip()
 
-    # 5. Form/Scoring (Look for 'FORM')
-    df_score_raw = fetch_csv(SHEET_URLS["scoring"], "FORM")
+    # 4. Form
+    df_score = fetch_csv(SHEET_URLS["scoring"], "FORM")
     df_form = pd.DataFrame()
-    if not df_score_raw.empty:
-        cols_to_keep = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score_raw.columns]
-        if 'Team' in df_score_raw.columns:
-            df_form = df_score_raw[cols_to_keep].copy()
+    if not df_score.empty:
+        cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
+        if 'Team' in df_score.columns:
+            df_form = df_score[cols].copy()
 
     return df_main, df_form, df_fix, df_chips
 
@@ -131,8 +115,7 @@ def get_fpl_metadata():
             elif e['is_next']: curr_gw = max(1, e['id'] - 1); break
             
         return elements, teams, curr_gw
-    except:
-        return {}, {}, 20
+    except: return {}, {}, 20
 
 def get_picks(fpl_id, gw):
     if not fpl_id: return []
@@ -162,15 +145,15 @@ def get_opponent(team_code, gw, df_fix):
 
 # --- APP START ---
 
-with st.spinner("Connecting to live QFPL data..."):
+with st.spinner("Connecting to QFPL Google Sheets..."):
     df, df_form, df_fix, df_used_chips = load_data_bundle()
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
 if df.empty:
-    st.error("Could not load data. Please check if the Google Sheets are published as CSV.")
+    st.error("Data load failed.")
     st.stop()
 
-# Ensure we don't have empty team names or 'x'
+# Build team list excluding junk
 teams_list = sorted([t for t in df['Team'].dropna().unique().tolist() if len(str(t)) > 1])
 
 # --- NAVIGATION ---
@@ -216,9 +199,11 @@ elif st.session_state.page == 'diff':
             if not t_b:
                 st.error("Opponent not found in fixtures.")
             else:
-                fetch_gw = min(gw, current_gw)
+                real_gw = get_current_gw()
+                fetch_gw = min(gw, real_gw)
+                
                 st.markdown(f"**Matchup:** {t_a} vs {t_b} (Phase {phase})")
-                if gw > current_gw: st.caption(f"Using squads from GW{fetch_gw}")
+                if gw > real_gw: st.caption(f"Using squads from GW{fetch_gw}")
 
                 if phase not in df.columns or df[phase].isnull().all():
                     st.error(f"Lineups for Phase {phase} unavailable.")
@@ -228,12 +213,9 @@ elif st.session_state.page == 'diff':
                         h = {}
                         team_rows = df[df['Team'] == tm]
                         active = team_rows[team_rows[phase].astype(str).str.upper().isin(['S','C'])]
-                        
-                        count=0
-                        total=len(active)
-                        for _, r in active.iterrows():
-                            count+=1
-                            prog.progress(int(s + (count/total * (e-s))), f"Loading {tm}...")
+                        total = len(active)
+                        for i, (_, r) in enumerate(active.iterrows()):
+                            if total>0: prog.progress(int(s + ((i+1)/total * (e-s))), f"Loading {tm}...")
                             mul = 2 if str(r[phase]).upper() == 'C' else 1
                             for p in get_picks(r['FPL_ID'], fetch_gw): h[p] = h.get(p, 0) + mul
                         return h
@@ -267,9 +249,7 @@ elif st.session_state.page == 'help':
     with c2: n_ph = st.selectbox("Submission Phase", [4, 5, 6, 7])
 
     data = []
-    team_rows = df[df['Team'] == my_team]
-    
-    for _, r in team_rows.iterrows():
+    for _, r in df[df['Team'] == my_team].iterrows():
         p1, p2 = str(n_ph - 1), str(n_ph - 2)
         must = False
         if p1 in df.columns and p2 in df.columns:
@@ -294,7 +274,6 @@ elif st.session_state.page == 'help':
             df_out.style.apply(lambda x: ['background-color: #f8d7da; font-weight: bold']*len(x) if x['_sort']==0 else ['background-color: #fff3cd']*len(x) if x['Captaincy']=="Used" else ['']*len(x), axis=1).hide(subset=['_sort'], axis='columns'),
             use_container_width=True, hide_index=True
         )
-    
     st.link_button("🚀 Submit", "https://docs.google.com/forms/d/e/1FAIpQLSfIPWcBe5LpLmI8dq5Jqxvw2ug9_9d2Ha9RIyREMEiBbNmyzQ/viewform", type="primary")
 
 # ==========================================
@@ -308,95 +287,103 @@ elif st.session_state.page == 'chip':
     with c1: team = st.selectbox("Team", teams_list)
     with c2: next_gw = st.number_input("Upcoming Gameweek", 1, 38, current_gw+1)
 
+    # Chip Info
+    CHIP_DESCS = {
+        "Red Hot Form": "Unlimited use. Requires 4 consecutive wins.",
+        "Stay Humble": "Single use. Play against an opponent who previously beat you.",
+        "Travelling Support": "Single use. Double points for away players.",
+        "Fox in the Box": "Single use. Double points for forwards.",
+        "Bought the Ref": "Single use. Double points for defenders.",
+        "Man Mark": "Single use. Cancel out an opponent player.",
+        "Park the Bus": "Single use. Defensive boost."
+    }
+
+    # Data Prep
     curr_phase = get_phase(next_gw)
-    chips_used_in_phase = 0
     
+    # 1. Calculate Phase Limit (Max 2 standard chips)
+    std_chips_used_in_phase = 0
     if curr_phase and not df_used_chips.empty:
         ranges = {'1':(1,5), '2':(6,10), '3':(12,16), '4':(17,21), '5':(23,27), '6':(28,32), '7':(34,38)}
         s, e = ranges[curr_phase]
         try:
-            # Use 'Your QFC' or similar column for team name
-            # We look for the first column
-            col_team = df_used_chips.columns[0]
-            col_chip = df_used_chips.columns[1]
-            col_status = df_used_chips.columns[2]
-            col_gw = df_used_chips.columns[3]
-
-            t_mask = df_used_chips[col_team].astype(str).str.contains(team, case=False)
-            s_mask = df_used_chips[col_status].astype(str) == 'Valid'
-            c_mask = df_used_chips[col_chip] != 'Red Hot Form'
+            # We already stripped ' QFC' from team names in load_data_bundle
+            subset = df_used_chips[
+                (df_used_chips.iloc[:,0] == team) & 
+                (df_used_chips.iloc[:,2] == 'Valid') & 
+                (df_used_chips.iloc[:,1] != 'Red Hot Form')
+            ].copy()
             
-            sub = df_used_chips[t_mask & s_mask & c_mask].copy()
-            sub['G'] = sub[col_gw].astype(str).str.extract(r'(\d+)').astype(float)
-            chips_used_in_phase = len(sub[(sub['G'] >= s) & (sub['G'] <= e)])
-        except: pass
+            subset['GW_Num'] = subset.iloc[:,3].astype(str).str.extract(r'(\d+)').astype(float)
+            std_chips_used_in_phase = len(subset[(subset['GW_Num'] >= s) & (subset['GW_Num'] <= e)])
+        except Exception as e: 
+            pass
 
-    limit_hit = (chips_used_in_phase >= 2)
+    phase_cap_reached = (std_chips_used_in_phase >= 2)
     
+    # 2. Get Full Team Name for Form Check
     full_team = team
     if not df_fix.empty:
         mapper = dict(zip(df_fix['ShortName'], df_fix['Team']))
         full_team = mapper.get(team, team)
 
-    chips = [
-        {"name": "Red Hot Form", "type": "form", "desc": "4 Wins in a row"},
-        {"name": "Stay Humble", "type": "humble", "desc": "Play vs team you lost to"},
-        {"name": "Travelling Support", "type": "std", "desc": "Standard"},
-        {"name": "Fox in the Box", "type": "std", "desc": "Standard"},
-        {"name": "Bought the Ref", "type": "std", "desc": "Standard"},
-        {"name": "Man Mark", "type": "std", "desc": "Standard"},
-        {"name": "Park the Bus", "type": "std", "desc": "Standard"}
-    ]
-    
+    # 3. Analyze Chips
     res = []
-    for c in chips:
-        # Check Usage
+    
+    for c_name, c_desc in CHIP_DESCS.items():
+        is_rhf = (c_name == "Red Hot Form")
+        is_humble = (c_name == "Stay Humble")
+        
+        # A. Check if Used (Lifetime)
         used = False
         try:
-            if not df_used_chips.empty:
-                col_team = df_used_chips.columns[0]
-                col_chip = df_used_chips.columns[1]
-                col_status = df_used_chips.columns[2]
-                
-                t_mask = df_used_chips[col_team].astype(str).str.contains(team, case=False)
-                c_mask = df_used_chips[col_chip] == c['name']
-                s_mask = df_used_chips[col_status] == 'Valid'
-                
-                if not df_used_chips[t_mask & c_mask & s_mask].empty: used = True
+            matches = df_used_chips[
+                (df_used_chips.iloc[:,0] == team) & 
+                (df_used_chips.iloc[:,1] == c_name) & 
+                (df_used_chips.iloc[:,2] == 'Valid')
+            ]
+            if not matches.empty: used = True
         except: pass
 
-        if c['name'] != "Red Hot Form" and used:
-            res.append({"Chip": c['name'], "Status": "Played", "Reason": "Used once per season", "_c": "grey"})
+        if not is_rhf and used:
+            res.append({
+                "Chip Name": c_name, "Description": c_desc, "Availability": "Played",
+                "Can be Played?": "No", "Comments": "Already used this season.", "_c": "grey"
+            })
             continue
         
-        if c['name'] != "Red Hot Form" and limit_hit:
-            res.append({"Chip": c['name'], "Status": "Unavailable", "Reason": f"Phase limit ({chips_used_in_phase}/2)", "_c": "red"})
+        # B. Check Phase Limit
+        if not is_rhf and phase_cap_reached:
+            res.append({
+                "Chip Name": c_name, "Description": c_desc, "Availability": "Unavailable",
+                "Can be Played?": "No", "Comments": f"Phase limit reached ({std_chips_used_in_phase}/2).", "_c": "red"
+            })
             continue
-            
-        # Logic Checks
-        stat, reason, col = "Available", "Ready", "green"
+
+        # C. Special Logic
+        status, can_play, comment, color = "Available", "Yes", "Ready to play.", "green"
         
-        if c['type'] == 'form':
+        if is_rhf:
+            # Check last 4 completed
             try:
                 t_row = df_form[df_form['Team'] == full_team]
                 if not t_row.empty:
                     last_4 = []
                     for g in range(next_gw-4, next_gw):
-                        if str(g) in t_row.columns: 
+                        if str(g) in t_row.columns:
                             val = str(t_row[str(g)].values[0]).upper()
                             if val in ['W','L','D']: last_4.append(val)
-                    
-                    if last_4 != ['W']*4:
-                        stat, reason, col = "Unavailable", f"Form: {last_4}", "red"
+                    if last_4 != ['W','W','W','W']:
+                        status, can_play, comment, color = "Unavailable", "No", f"Form is {last_4} (Need 4 Wins).", "red"
                 else:
-                    stat, reason, col = "Unavailable", "Form data missing", "red"
+                    status, can_play, comment, color = "Unavailable", "No", "Form data missing.", "red"
             except: pass
             
-        elif c['type'] == 'humble':
+        elif is_humble:
             try:
                 opp = get_opponent(team, next_gw, df_fix)
                 if not opp:
-                    stat, reason, col = "Unavailable", "No fixture found", "red"
+                    status, can_play, comment, color = "Unavailable", "No", "No fixture found.", "red"
                 else:
                     found_loss = False
                     for g in range(1, next_gw):
@@ -406,12 +393,23 @@ elif st.session_state.page == 'chip':
                             if not t_row.empty and str(t_row[str(g)].values[0]).upper() == 'L':
                                 found_loss = True; break
                     if not found_loss:
-                        stat, reason, col = "Unavailable", f"Haven't lost to {opp}", "red"
+                        status, can_play, comment, color = "Unavailable", "No", f"Haven't lost to {opp} yet.", "red"
+                    else:
+                        comment = f"Lost to {opp} previously. Go for revenge!"
             except: pass
 
-        res.append({"Chip": c['name'], "Status": stat, "Reason": reason, "_c": col})
+        res.append({
+            "Chip Name": c_name, "Description": c_desc, "Availability": status,
+            "Can be Played?": can_play, "Comments": comment, "_c": color
+        })
 
+    # Render Table
     rdf = pd.DataFrame(res)
-    if not rdf.empty:
-        st.dataframe(rdf.style.apply(lambda x: [f'background-color: {"#d1e7dd" if x["_c"]=="green" else "#f8d7da" if x["_c"]=="red" else "#e2e3e5"}; color: black']*len(x), axis=1).hide(subset=['_c'], axis='columns'), use_container_width=True, hide_index=True)
+    st.dataframe(
+        rdf.style.apply(lambda x: [f'background-color: {"#d1e7dd" if x["_c"]=="green" else "#f8d7da" if x["_c"]=="red" else "#e2e3e5"}; color: black']*len(x), axis=1)
+        .hide(subset=['_c'], axis='columns'),
+        use_container_width=True, hide_index=True
+    )
+    
+    st.divider()
     st.link_button("🍟 Submit Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform", type="primary")
