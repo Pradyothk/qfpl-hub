@@ -27,16 +27,22 @@ SHEET_URLS = {
 
 @st.cache_data(ttl=600)
 def fetch_csv(url, key_col=None):
+    """Fetches CSV data and automatically finds the header row."""
     try:
         response = requests.get(url)
         response.raise_for_status()
         content = response.content.decode('utf-8')
+        
+        # 1. Try reading normally
         df = pd.read_csv(io.StringIO(content))
         
+        # 2. Smart Header Search
         if key_col:
+            # Normalize cols to lowercase for search
             cols_lower = [str(c).lower() for c in df.columns]
             if key_col.lower() not in cols_lower:
                 lines = content.splitlines()
+                # Check first 50 lines for the key column
                 for i, line in enumerate(lines[:50]): 
                     if key_col.lower() in line.lower():
                         df = pd.read_csv(io.StringIO(content), header=i)
@@ -51,6 +57,7 @@ def load_data_bundle():
     # 1. Lineups
     df_l = fetch_csv(SHEET_URLS["lineups"], "PLAYER")
     if not df_l.empty:
+        # Parse Lineups Columns
         p_idx = -1
         for i, c in enumerate(df_l.columns):
             if str(c).strip().upper() == "PLAYER":
@@ -72,10 +79,12 @@ def load_data_bundle():
     if not df_l.empty and not df_r.empty:
         df_main = pd.merge(df_l, df_r[['Player', 'FPL_ID']], on='Player', how='left')
 
-    # 3. Chips Data
+    # 3. Chips & Fixtures
     df_fix = fetch_csv(SHEET_URLS["fixtures"], "ShortName")
+    
     df_chips = fetch_csv(SHEET_URLS["chips"], "Chip Played")
     if not df_chips.empty:
+        # Standardize Chip Columns
         df_chips.columns = [c.strip().replace(':', '') for c in df_chips.columns]
         
         cols = df_chips.columns
@@ -87,15 +96,33 @@ def load_data_bundle():
             df_chips['CleanTeam'] = df_chips[c_team].astype(str).str.replace(' QFC', '', regex=False).str.strip()
         
         if c_gw:
+            # Clean GW: "GW06" -> 6
             df_chips['GW_Int'] = df_chips[c_gw].astype(str).str.extract(r'(\d+)').astype(float)
 
-    # 4. Form
-    df_score = fetch_csv(SHEET_URLS["scoring"], "FORM")
-    df_form = pd.DataFrame()
-    if not df_score.empty:
-        cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
-        if 'Team' in df_score.columns:
-            df_form = df_score[cols].copy()
+    # 4. Form (ROBUST LOADING)
+    # The 'FORM' table is tricky. We read the raw text and find the exact row 
+    # that has "Team", "1", and "2" to identify the real header.
+    df_form = pd.DataFrame(columns=['Team']) # Init with Team column to prevent KeyError
+    try:
+        response = requests.get(SHEET_URLS["scoring"])
+        response.raise_for_status()
+        content = response.content.decode('utf-8')
+        
+        lines = content.splitlines()
+        header_row = None
+        for i, line in enumerate(lines):
+            # Look for the row containing "Team" and Gameweek numbers
+            if "Team" in line and ",1," in line and ",2," in line:
+                header_row = i
+                break
+        
+        if header_row is not None:
+            df_score = pd.read_csv(io.StringIO(content), header=header_row)
+            if 'Team' in df_score.columns:
+                cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
+                df_form = df_score[cols].copy()
+    except:
+        pass
 
     return df_main, df_form, df_fix, df_chips
 
@@ -139,7 +166,7 @@ def get_fixture_raw(team_code, gw, df_fix):
     if row.empty: return None
     col = f"GW{gw}"
     if col not in row.columns: return None
-    return str(row[col].values[0]) # Returns raw string (e.g., 'che' or 'CHE')
+    return str(row[col].values[0]) # Returns raw string (e.g. 'che' or 'CHE')
 
 # --- APP START ---
 
@@ -148,7 +175,7 @@ with st.spinner("Connecting to live QFPL data..."):
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
 if df.empty:
-    st.error("Data load failed.")
+    st.error("Data load failed. Please check the Google Sheet Links.")
     st.stop()
 
 teams_list = sorted([t for t in df['Team'].dropna().unique().tolist() if len(str(t)) > 1])
@@ -287,7 +314,7 @@ elif st.session_state.page == 'chip':
     with c1: team = st.selectbox("Team", teams_list)
     with c2: next_gw = st.number_input("Upcoming Gameweek", 1, 38, current_gw+1)
 
-    # 1. Identify Data Columns
+    # 1. Identify Columns
     cols = df_used_chips.columns
     c_chip = next((c for c in cols if "Chip" in c), None)
     c_status = next((c for c in cols if "Status" in c), None)
@@ -304,27 +331,26 @@ elif st.session_state.page == 'chip':
                 (df_used_chips[c_status] == 'Valid') & 
                 (df_used_chips[c_chip] != 'Red Hot Form')
             ].copy()
-            
             phase_count = len(team_chips[(team_chips['GW_Int'] >= s) & (team_chips['GW_Int'] <= e)])
             chips_used_in_phase = phase_count
         except: pass
 
     phase_limit_reached = (chips_used_in_phase >= 2)
     
-    # 3. Full Team Name & Mappers
+    # 3. Full Team Name Logic
     full_team = team
     if not df_fix.empty:
         mapper = dict(zip(df_fix['ShortName'], df_fix['Team']))
         full_team = mapper.get(team, team)
 
-    # 4. Analysis
+    # 4. Chip Analysis
     chips_list = ["Red Hot Form", "Stay Humble", "Travelling Support", "Fox in the Box", "Bought the Ref", "Man Mark", "Park the Bus"]
     res = []
     
     for c_name in chips_list:
         is_rhf = (c_name == "Red Hot Form")
         
-        # Check if Used (Standard)
+        # A. Check Usage
         used = False
         last_rhf_gw = 0
         try:
@@ -343,24 +369,24 @@ elif st.session_state.page == 'chip':
         comment = "Ready to play."
         color = "green"
 
-        # A. Usage Checks
+        # Rule 1: Lifetime (Except RHF)
         if not is_rhf and used:
             res.append({"Chip Name": c_name, "Availability": "No", "Can be Played?": "No", "Comments": "Already played.", "_c": "grey"})
             continue
         
-        if not is_rhf and phase_limit_reached:
-            res.append({"Chip Name": c_name, "Availability": "Yes", "Can be Played?": "No", "Comments": f"Phase limit ({chips_used_in_phase}/2).", "_c": "red"})
+        # Rule 2: Phase Limit (Except RHF)
+        elif not is_rhf and phase_limit_reached:
+            res.append({"Chip Name": c_name, "Availability": "Yes", "Can be Played?": "No", "Comments": f"Phase limit ({chips_used_in_phase}/2 used).", "_c": "red"})
             continue
 
-        # B. Special Logic
+        # Rule 3: Specific Logic
         if is_rhf:
-            # Cooldown check
             gap = next_gw - last_rhf_gw
             if gap <= 4:
                 avail = "No"; can_play = "No"; comment = f"Played in GW{int(last_rhf_gw)}. Reset gap {gap}/5."; color = "red"
             else:
-                # 4 Wins Check
                 try:
+                    if df_form.empty: raise ValueError("Empty")
                     t_row = df_form[df_form['Team'] == full_team]
                     if not t_row.empty:
                         last_4 = []
@@ -371,25 +397,27 @@ elif st.session_state.page == 'chip':
                         if last_4 != ['W']*4:
                             can_play = "No"; comment = f"Need 4 Wins. Form: {last_4}"; color = "red"
                     else:
-                        can_play = "No"; comment = "Form unavailable."; color = "red"
-                except: pass
+                        can_play = "No"; comment = "Form data missing."; color = "red"
+                except:
+                    can_play = "No"; comment = "Form data unavailable."; color = "red"
 
         elif c_name == "Stay Humble":
-            # Must be a team you lost to
-            raw_opp = get_fixture_raw(team, next_gw, df_fix)
-            if not raw_opp:
-                can_play = "No"; comment = "No fixture."; color = "red"
-            else:
-                opp_code = raw_opp.upper()
-                found_loss = False
-                for g in range(1, next_gw):
-                    hist_raw = get_fixture_raw(team, g, df_fix)
-                    if hist_raw and hist_raw.upper() == opp_code:
-                        t_row = df_form[df_form['Team'] == full_team]
-                        if not t_row.empty and str(t_row[str(g)].values[0]).upper() == 'L':
-                            found_loss = True; break
-                if not found_loss:
-                    can_play = "No"; comment = f"Must play vs team you lost to (vs {opp_code})."; color = "red"
+            try:
+                raw_opp = get_fixture_raw(team, next_gw, df_fix)
+                if not raw_opp:
+                    can_play = "No"; comment = "No fixture."; color = "red"
+                else:
+                    opp_code = raw_opp.upper()
+                    found_loss = False
+                    for g in range(1, next_gw):
+                        hist_raw = get_fixture_raw(team, g, df_fix)
+                        if hist_raw and hist_raw.upper() == opp_code:
+                            t_row = df_form[df_form['Team'] == full_team]
+                            if not t_row.empty and str(t_row[str(g)].values[0]).upper() == 'L':
+                                found_loss = True; break
+                    if not found_loss:
+                        can_play = "No"; comment = f"Must play vs team you lost to (vs {opp_code})."; color = "red"
+            except: pass
         
         elif c_name == "Travelling Support":
             # Must be Away (lowercase in fixtures)
