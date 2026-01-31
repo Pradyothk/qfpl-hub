@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# 1. LIVE DATA LINKS (UPDATED)
+# 1. LIVE DATA LINKS
 # ==========================================
 SHEET_URLS = {
     "lineups": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSW-bUC-2pv_0v0zVGMEkvecItvGWF1tCiOdy-abcLT8i0Ea7YCAofFzZ6cvUQfvbb1HGNyu1YV3hrM/pub?gid=1076160662&single=true&output=csv",
@@ -36,13 +36,16 @@ def fetch_csv(url, key_col=None):
         # 1. Try reading normally
         df = pd.read_csv(io.StringIO(content))
         
-        # 2. Smart Header Search (if key_col provided and missing)
-        if key_col and key_col not in df.columns:
-            lines = content.splitlines()
-            for i, line in enumerate(lines[:100]): 
-                if key_col.lower() in line.lower():
-                    df = pd.read_csv(io.StringIO(content), header=i)
-                    break
+        # 2. Smart Header Search
+        if key_col:
+            # Normalize cols to lowercase for search
+            cols_lower = [str(c).lower() for c in df.columns]
+            if key_col.lower() not in cols_lower:
+                lines = content.splitlines()
+                for i, line in enumerate(lines[:50]): 
+                    if key_col.lower() in line.lower():
+                        df = pd.read_csv(io.StringIO(content), header=i)
+                        break
         return df
     except Exception as e:
         st.error(f"Error reading sheet: {e}")
@@ -52,13 +55,35 @@ def fetch_csv(url, key_col=None):
 def load_data_bundle():
     # 1. Lineups (Look for 'PLAYER' column)
     df_l = fetch_csv(SHEET_URLS["lineups"], "PLAYER")
+    
+    # --- FIX FOR "x" IN DROPDOWN ---
     if not df_l.empty:
-        try:
-            # Clean columns by index: Team, Player, Phases 1-7
-            # Typically indices 0,1,3,4,5,6,7,8,9 in your specific sheet format
-            df_l = df_l.iloc[:, [0, 1, 3, 4, 5, 6, 7, 8, 9]]
-            df_l.columns = ['Team', 'Player', '1', '2', '3', '4', '5', '6', '7']
-        except: pass
+        # Find the column index of "PLAYER"
+        # We assume the structure is: [Empty?, TEAM, PLAYER, TEAM, 1, 2, 3...]
+        player_col_idx = -1
+        for i, col in enumerate(df_l.columns):
+            if str(col).strip().upper() == "PLAYER":
+                player_col_idx = i
+                break
+        
+        if player_col_idx != -1:
+            # Team is 1 left of Player
+            # Phases start 2 right of Player (skipping the duplicate Team col)
+            idx_team = player_col_idx - 1
+            idx_player = player_col_idx
+            idx_phases = list(range(player_col_idx + 2, player_col_idx + 9)) # 7 phases
+            
+            target_indices = [idx_team, idx_player] + idx_phases
+            
+            # Safe slice
+            try:
+                df_l = df_l.iloc[:, target_indices]
+                df_l.columns = ['Team', 'Player', '1', '2', '3', '4', '5', '6', '7']
+            except:
+                st.error("Could not parse Lineups columns automatically. Check sheet structure.")
+        else:
+            # Fallback if we can't find "PLAYER" header logic
+            pass
 
     # 2. Registrations (Look for 'Profile')
     df_r = fetch_csv(SHEET_URLS["registrations"], "Profile")
@@ -76,13 +101,13 @@ def load_data_bundle():
     # 4. Chips (Look for 'Chip Played')
     df_chips = fetch_csv(SHEET_URLS["chips"], "Chip Played")
     if not df_chips.empty:
-        df_chips.rename(columns=lambda x: x.strip().replace(':', ''), inplace=True)
+        # Normalize columns (strip spaces, remove colons)
+        df_chips.columns = [c.strip().replace(':', '') for c in df_chips.columns]
 
     # 5. Form/Scoring (Look for 'FORM')
     df_score_raw = fetch_csv(SHEET_URLS["scoring"], "FORM")
     df_form = pd.DataFrame()
     if not df_score_raw.empty:
-        # Keep Team and GW columns (1-38)
         cols_to_keep = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score_raw.columns]
         if 'Team' in df_score_raw.columns:
             df_form = df_score_raw[cols_to_keep].copy()
@@ -142,10 +167,11 @@ with st.spinner("Connecting to live QFPL data..."):
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
 if df.empty:
-    st.error("Could not load data. Please check your Google Sheet Links.")
+    st.error("Could not load data. Please check if the Google Sheets are published as CSV.")
     st.stop()
 
-teams_list = sorted(df['Team'].dropna().unique().tolist())
+# Ensure we don't have empty team names or 'x'
+teams_list = sorted([t for t in df['Team'].dropna().unique().tolist() if len(str(t)) > 1])
 
 # --- NAVIGATION ---
 if 'page' not in st.session_state: st.session_state.page = 'home'
@@ -284,17 +310,24 @@ elif st.session_state.page == 'chip':
 
     curr_phase = get_phase(next_gw)
     chips_used_in_phase = 0
+    
     if curr_phase and not df_used_chips.empty:
         ranges = {'1':(1,5), '2':(6,10), '3':(12,16), '4':(17,21), '5':(23,27), '6':(28,32), '7':(34,38)}
         s, e = ranges[curr_phase]
         try:
-            # Fuzzy match team name
-            t_mask = df_used_chips.iloc[:, 0].astype(str).str.contains(team, case=False)
-            s_mask = df_used_chips.iloc[:, 2].astype(str) == 'Valid'
-            c_mask = df_used_chips.iloc[:, 1] != 'Red Hot Form'
+            # Use 'Your QFC' or similar column for team name
+            # We look for the first column
+            col_team = df_used_chips.columns[0]
+            col_chip = df_used_chips.columns[1]
+            col_status = df_used_chips.columns[2]
+            col_gw = df_used_chips.columns[3]
+
+            t_mask = df_used_chips[col_team].astype(str).str.contains(team, case=False)
+            s_mask = df_used_chips[col_status].astype(str) == 'Valid'
+            c_mask = df_used_chips[col_chip] != 'Red Hot Form'
             
             sub = df_used_chips[t_mask & s_mask & c_mask].copy()
-            sub['G'] = sub.iloc[:, 3].astype(str).str.extract(r'(\d+)').astype(float)
+            sub['G'] = sub[col_gw].astype(str).str.extract(r'(\d+)').astype(float)
             chips_used_in_phase = len(sub[(sub['G'] >= s) & (sub['G'] <= e)])
         except: pass
 
@@ -321,9 +354,14 @@ elif st.session_state.page == 'chip':
         used = False
         try:
             if not df_used_chips.empty:
-                t_mask = df_used_chips.iloc[:, 0].astype(str).str.contains(team, case=False)
-                c_mask = df_used_chips.iloc[:, 1] == c['name']
-                s_mask = df_used_chips.iloc[:, 2] == 'Valid'
+                col_team = df_used_chips.columns[0]
+                col_chip = df_used_chips.columns[1]
+                col_status = df_used_chips.columns[2]
+                
+                t_mask = df_used_chips[col_team].astype(str).str.contains(team, case=False)
+                c_mask = df_used_chips[col_chip] == c['name']
+                s_mask = df_used_chips[col_status] == 'Valid'
+                
                 if not df_used_chips[t_mask & c_mask & s_mask].empty: used = True
         except: pass
 
@@ -335,7 +373,7 @@ elif st.session_state.page == 'chip':
             res.append({"Chip": c['name'], "Status": "Unavailable", "Reason": f"Phase limit ({chips_used_in_phase}/2)", "_c": "red"})
             continue
             
-        # Logic
+        # Logic Checks
         stat, reason, col = "Available", "Ready", "green"
         
         if c['type'] == 'form':
@@ -347,8 +385,11 @@ elif st.session_state.page == 'chip':
                         if str(g) in t_row.columns: 
                             val = str(t_row[str(g)].values[0]).upper()
                             if val in ['W','L','D']: last_4.append(val)
+                    
                     if last_4 != ['W']*4:
                         stat, reason, col = "Unavailable", f"Form: {last_4}", "red"
+                else:
+                    stat, reason, col = "Unavailable", "Form data missing", "red"
             except: pass
             
         elif c['type'] == 'humble':
