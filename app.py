@@ -23,7 +23,7 @@ SHEET_URLS = {
     "chips": "https://docs.google.com/spreadsheets/d/e/2PACX-1vS7LIgpfq7K-bb_1I7ZTf8XaKlaFclQq49IVHiBMqIpfwiQfiS5bk0B6lQcRwAijf6ZyvLOC1Vp3VfH/pub?gid=805641470&single=true&output=csv"
 }
 
-# --- DATA LOADING ---
+# --- DATA LOADING FUNCTIONS ---
 
 @st.cache_data(ttl=600)
 def fetch_csv(url, key_col=None):
@@ -76,22 +76,17 @@ def load_data_bundle():
     df_fix = fetch_csv(SHEET_URLS["fixtures"], "ShortName")
     df_chips = fetch_csv(SHEET_URLS["chips"], "Chip Played")
     if not df_chips.empty:
-        # Standardize Chip Columns
         df_chips.columns = [c.strip().replace(':', '') for c in df_chips.columns]
         
-        # Identify columns dynamically
         cols = df_chips.columns
         c_team = next((c for c in cols if "QFC" in c or "Team" in c), None)
-        c_chip = next((c for c in cols if "Chip" in c), None)
         c_gw = next((c for c in cols if "GW" in c or "Gameweek" in c), None)
-        c_stat = next((c for c in cols if "Status" in c), None)
         
         if c_team:
             # Clean Team Name: "Fulham QFC" -> "Fulham"
             df_chips['CleanTeam'] = df_chips[c_team].astype(str).str.replace(' QFC', '', regex=False).str.strip()
         
         if c_gw:
-            # Clean GW: "GW06" -> 6
             df_chips['GW_Int'] = df_chips[c_gw].astype(str).str.extract(r'(\d+)').astype(float)
 
     # 4. Form
@@ -138,13 +133,13 @@ def get_phase(gw):
     if 34 <= gw <= 38: return '7'
     return None
 
-def get_opponent(team_code, gw, df_fix):
+def get_fixture_raw(team_code, gw, df_fix):
     if df_fix.empty: return None
     row = df_fix[df_fix['ShortName'] == team_code]
     if row.empty: return None
     col = f"GW{gw}"
     if col not in row.columns: return None
-    return str(row[col].values[0]).upper()
+    return str(row[col].values[0]) # Returns raw string (e.g., 'che' or 'CHE')
 
 # --- APP START ---
 
@@ -196,11 +191,13 @@ elif st.session_state.page == 'diff':
         if not phase:
             st.error(f"GW{gw} is not in a QFPL Phase.")
         else:
-            t_b = get_opponent(t_a, gw, df_fix)
-            if not t_b:
+            raw_opp = get_fixture_raw(t_a, gw, df_fix)
+            if not raw_opp:
                 st.error("Opponent not found in fixtures.")
             else:
+                t_b = raw_opp.upper()
                 fetch_gw = min(gw, current_gw)
+                
                 st.markdown(f"**Matchup:** {t_a} vs {t_b} (Phase {phase})")
                 if gw > current_gw: st.caption(f"Using squads from GW{fetch_gw}")
 
@@ -216,7 +213,7 @@ elif st.session_state.page == 'diff':
                         count = 0
                         for i, (_, r) in enumerate(active.iterrows()):
                             count+=1
-                            prog.progress(int(s + ((count)/total * (e-s))), f"Loading {tm}...")
+                            if total > 0: prog.progress(int(s + ((count)/total * (e-s))), f"Loading {tm}...")
                             mul = 2 if str(r[phase]).upper() == 'C' else 1
                             for p in get_picks(r['FPL_ID'], fetch_gw): h[p] = h.get(p, 0) + mul
                         return h
@@ -302,21 +299,19 @@ elif st.session_state.page == 'chip':
         ranges = {'1':(1,5), '2':(6,10), '3':(12,16), '4':(17,21), '5':(23,27), '6':(28,32), '7':(34,38)}
         s, e = ranges[curr_phase]
         try:
-            # Use 'CleanTeam' created in load_data_bundle
             team_chips = df_used_chips[
                 (df_used_chips['CleanTeam'].str.contains(team, case=False)) & 
                 (df_used_chips[c_status] == 'Valid') & 
                 (df_used_chips[c_chip] != 'Red Hot Form')
             ].copy()
             
-            # Count chips in range
             phase_count = len(team_chips[(team_chips['GW_Int'] >= s) & (team_chips['GW_Int'] <= e)])
             chips_used_in_phase = phase_count
         except: pass
 
     phase_limit_reached = (chips_used_in_phase >= 2)
     
-    # 3. Full Team Name
+    # 3. Full Team Name & Mappers
     full_team = team
     if not df_fix.empty:
         mapper = dict(zip(df_fix['ShortName'], df_fix['Team']))
@@ -330,101 +325,80 @@ elif st.session_state.page == 'chip':
         is_rhf = (c_name == "Red Hot Form")
         
         # Check if Used (Standard)
-        used_std = False
-        last_rhf_gw = 0 # For cooldown check
+        used = False
+        last_rhf_gw = 0
         try:
-            # Filter for this specific chip
             matches = df_used_chips[
                 (df_used_chips['CleanTeam'].str.contains(team, case=False)) & 
                 (df_used_chips[c_chip] == c_name) & 
                 (df_used_chips[c_status] == 'Valid')
             ]
             if not matches.empty:
-                used_std = True
-                if is_rhf:
-                    last_rhf_gw = matches['GW_Int'].max()
+                used = True
+                if is_rhf: last_rhf_gw = matches['GW_Int'].max()
         except: pass
 
-        # Default State
         avail = "Yes"
         can_play = "Yes"
         comment = "Ready to play."
         color = "green"
 
-        # Rule A: Standard Chips (Once per season)
-        if not is_rhf and used_std:
-            avail = "No"
-            can_play = "No"
-            comment = "Already played this season."
-            color = "grey"
+        # A. Usage Checks
+        if not is_rhf and used:
+            res.append({"Chip Name": c_name, "Availability": "No", "Can be Played?": "No", "Comments": "Already played.", "_c": "grey"})
+            continue
         
-        # Rule B: Phase Limit (Standard Chips)
-        elif not is_rhf and phase_limit_reached:
-            avail = "Yes" # Technically avail
-            can_play = "No"
-            comment = f"Phase limit reached ({chips_used_in_phase}/2 used)."
-            color = "red"
+        if not is_rhf and phase_limit_reached:
+            res.append({"Chip Name": c_name, "Availability": "Yes", "Can be Played?": "No", "Comments": f"Phase limit ({chips_used_in_phase}/2).", "_c": "red"})
+            continue
 
-        # Rule C: Red Hot Form (Cooldown & Streak)
-        elif is_rhf:
-            # Check Cooldown (Streak reset)
-            # Must be at least 4 gameweeks SINCE the last play
-            # e.g. Played 23. Next 24. 24 - 23 = 1 (Too soon). Need gap > 4.
+        # B. Special Logic
+        if is_rhf:
+            # Cooldown check
             gap = next_gw - last_rhf_gw
             if gap <= 4:
-                avail = "No"
-                can_play = "No"
-                comment = f"Played in GW{int(last_rhf_gw)}. Streak resets (Gap {gap}/5)."
-                color = "red"
+                avail = "No"; can_play = "No"; comment = f"Played in GW{int(last_rhf_gw)}. Reset gap {gap}/5."; color = "red"
             else:
-                # Check 4 Wins
+                # 4 Wins Check
                 try:
                     t_row = df_form[df_form['Team'] == full_team]
                     if not t_row.empty:
                         last_4 = []
-                        # Check strictly previous 4 games
                         for g in range(next_gw-4, next_gw):
                             if str(g) in t_row.columns:
                                 val = str(t_row[str(g)].values[0]).upper()
                                 if val in ['W','L','D']: last_4.append(val)
-                        
                         if last_4 != ['W']*4:
-                            can_play = "No"
-                            comment = f"Need 4 consecutive wins. Form: {last_4}"
-                            color = "red"
+                            can_play = "No"; comment = f"Need 4 Wins. Form: {last_4}"; color = "red"
                     else:
-                        can_play = "No"; comment = "Form data unavailable."; color = "red"
+                        can_play = "No"; comment = "Form unavailable."; color = "red"
                 except: pass
 
-        # Rule D: Stay Humble
         elif c_name == "Stay Humble":
-            try:
-                opp = get_opponent(team, next_gw, df_fix)
-                if not opp:
-                    can_play = "No"; comment = "No fixture found."; color = "red"
-                else:
-                    found_loss = False
-                    for g in range(1, next_gw):
-                        hist_opp = get_opponent(team, g, df_fix)
-                        if hist_opp == opp:
-                            t_row = df_form[df_form['Team'] == full_team]
-                            if not t_row.empty and str(t_row[str(g)].values[0]).upper() == 'L':
-                                found_loss = True; break
-                    if not found_loss:
-                        can_play = "No"
-                        comment = f"Must play opponent who beat you (vs {opp})."
-                        color = "red"
-            except: pass
+            # Must be a team you lost to
+            raw_opp = get_fixture_raw(team, next_gw, df_fix)
+            if not raw_opp:
+                can_play = "No"; comment = "No fixture."; color = "red"
+            else:
+                opp_code = raw_opp.upper()
+                found_loss = False
+                for g in range(1, next_gw):
+                    hist_raw = get_fixture_raw(team, g, df_fix)
+                    if hist_raw and hist_raw.upper() == opp_code:
+                        t_row = df_form[df_form['Team'] == full_team]
+                        if not t_row.empty and str(t_row[str(g)].values[0]).upper() == 'L':
+                            found_loss = True; break
+                if not found_loss:
+                    can_play = "No"; comment = f"Must play vs team you lost to (vs {opp_code})."; color = "red"
+        
+        elif c_name == "Travelling Support":
+            # Must be Away (lowercase in fixtures)
+            raw_fix = get_fixture_raw(team, next_gw, df_fix)
+            if raw_fix and raw_fix.isupper():
+                can_play = "No"; comment = f"Home game vs {raw_fix}. Must be Away."; color = "red"
 
-        res.append({
-            "Chip Name": c_name,
-            "Availability": avail,
-            "Can be Played?": can_play,
-            "Comments": comment,
-            "_c": color
-        })
+        res.append({"Chip Name": c_name, "Availability": avail, "Can be Played?": can_play, "Comments": comment, "_c": color})
 
-    # Render
     rdf = pd.DataFrame(res)
     st.dataframe(
         rdf.style.apply(lambda x: [f'background-color: {"#d1e7dd" if x["_c"]=="green" else "#f8d7da" if x["_c"]=="red" else "#e2e3e5"}; color: black']*len(x), axis=1)
