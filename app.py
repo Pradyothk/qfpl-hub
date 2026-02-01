@@ -34,7 +34,6 @@ def fetch_csv(url, key_col=None, header_mode='infer'):
         content = response.content.decode('utf-8')
         
         if header_mode is None:
-            # Read raw grid without assuming headers
             return pd.read_csv(io.StringIO(content), header=None)
         
         df = pd.read_csv(io.StringIO(content))
@@ -195,7 +194,7 @@ if st.session_state.page == 'home':
         st.button("Chip Helper", on_click=go, args=('chip',), use_container_width=True)
 
 # ==========================================
-# PAGE: LIVE SCORES (CLEAN & COLORED)
+# PAGE: LIVE SCORES (OPTIMIZED COLORS)
 # ==========================================
 elif st.session_state.page == 'scores':
     st.button("← Back", on_click=go, args=('home',))
@@ -213,37 +212,32 @@ elif st.session_state.page == 'scores':
             # 2. Drop empty rows (The blank rows in the sheet)
             subset = subset.dropna(subset=['Home Team'])
             
-            # 3. Styling Function (Logic: Win >= 6, Loss <= -6, Draw within 5)
+            # 3. Styling: Text Color instead of Background
             def style_dashboard(row):
                 try:
                     h_val = float(row['Home Score'])
                     a_val = float(row['Away Score'])
                     diff = h_val - a_val
                     
-                    # Colors
-                    win_col = 'background-color: #d1e7dd; color: black' # Green
-                    draw_col = 'background-color: #fff3cd; color: black' # Yellow
-                    loss_col = 'background-color: #f8d7da; color: black' # Red
+                    # Colors (Matched to other tools)
+                    win_txt = 'color: #09AB3B; font-weight: bold' # Green
+                    draw_txt = 'color: #FFA500; font-weight: bold' # Orange
+                    loss_txt = 'color: #FF4B4B; font-weight: bold' # Red
                     
                     # Home Perspective
-                    if diff >= 6: h_style = win_col
-                    elif diff <= -6: h_style = loss_col
-                    else: h_style = draw_col
+                    if diff >= 6: h_style = win_txt
+                    elif diff <= -6: h_style = loss_txt
+                    else: h_style = draw_txt
                     
-                    # Away Perspective (Inverse of Home)
-                    if diff <= -6: a_style = win_col # Away wins if diff is negative
-                    elif diff >= 6: a_style = loss_col
-                    else: a_style = draw_col
+                    # Away Perspective
+                    if diff <= -6: a_style = win_txt
+                    elif diff >= 6: a_style = loss_txt
+                    else: a_style = draw_txt
                     
-                    # Default
-                    def_style = ''
-                    
-                    return [h_style, h_style, def_style, a_style, a_style, def_style]
+                    return [h_style, h_style, '', a_style, a_style, '']
                 except:
-                    # If scores are not numbers (e.g. empty or text), return no style
                     return [''] * 6
 
-            # Apply style and display
             st.dataframe(subset.style.apply(style_dashboard, axis=1), use_container_width=True, hide_index=True)
             
         except Exception as e:
@@ -324,7 +318,6 @@ elif st.session_state.page == 'help':
     if st.button("Analyze", type="primary"):
         data = []
         team_rows = df[df['Team'] == my_team]
-        
         phases_remaining = 8 - n_ph
         
         for _, r in team_rows.iterrows():
@@ -497,7 +490,6 @@ elif st.session_state.page == 'chip':
             res.append({"Chip Name": c_name, "Availability": avail, "Can be Played?": can_play, "Comments": comment, "_c": color})
 
         rdf = pd.DataFrame(res)
-        
         def style_chip_row(row):
             c = row['_c']
             color_css = ''
