@@ -24,16 +24,54 @@ SHEET_URLS = {
     "dashboard": "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMx7WNVySFfJuAjKyc5PvPnL5XAz9FzLbIXFL5qjqwt4_YCJmuNax_jMsfxnRXoekHKQzFmYUu5YEM/pub?gid=0&single=true&output=csv"
 }
 
-# --- DATA LOADING FUNCTIONS ---
+# B. ANALYTICS CONFIG (Safe Mode)
+ANALYTICS = {
+    "enabled": True, # Enabled but will fail silently if URL is invalid
+    "form_url": "PASTE_GOOGLE_FORM_RESPONSE_URL_HERE", 
+    "entries": {
+        "page": "entry.XXXXXX",
+        "team": "entry.XXXXXX",
+        "action": "entry.XXXXXX",
+        "details": "entry.XXXXXX"
+    }
+}
+
+# --- FUNCTIONS ---
+
+def track_event(page, team, action, details=""):
+    """Silently logs events to Google Forms."""
+    if not ANALYTICS["enabled"] or "PASTE" in ANALYTICS["form_url"]:
+        return
+    try:
+        data = {
+            ANALYTICS["entries"]["page"]: str(page),
+            ANALYTICS["entries"]["team"]: str(team),
+            ANALYTICS["entries"]["action"]: str(action),
+            ANALYTICS["entries"]["details"]: str(details)
+        }
+        requests.post(ANALYTICS["form_url"], data=data, timeout=1)
+    except: pass
 
 @st.cache_data(ttl=600)
-def fetch_csv(url, key_col=None):
+def fetch_csv(url, key_col=None, header_mode='infer'):
+    """
+    Fetches CSV data. 
+    header_mode='infer' uses auto detection. 
+    header_mode=None reads raw grid (good for dashboards).
+    """
     try:
         response = requests.get(url)
         response.raise_for_status()
         content = response.content.decode('utf-8')
+        
+        if header_mode is None:
+            # Read raw grid without assuming headers
+            return pd.read_csv(io.StringIO(content), header=None)
+        
+        # Standard Read
         df = pd.read_csv(io.StringIO(content))
         
+        # Smart Header Search
         if key_col:
             cols_lower = [str(c).lower() for c in df.columns]
             if key_col.lower() not in cols_lower:
@@ -87,28 +125,17 @@ def load_data_bundle():
         if c_gw:
             df_chips['GW_Int'] = df_chips[c_gw].astype(str).str.extract(r'(\d+)').astype(float)
 
-    # 4. Form (Scoring)
-    # The 'FORM' table is tricky. We search for the specific header row.
+    # 4. Form
+    df_score = fetch_csv(SHEET_URLS["scoring"], "FORM")
     df_form = pd.DataFrame()
     try:
-        response = requests.get(SHEET_URLS["scoring"])
-        content = response.content.decode('utf-8')
-        lines = content.splitlines()
-        header_row = None
-        for i, line in enumerate(lines):
-            # Look for row with "Team", "1", "2"
-            if "Team" in line and ",1," in line and ",2," in line:
-                header_row = i; break
-        
-        if header_row is not None:
-            df_score = pd.read_csv(io.StringIO(content), header=header_row)
+        if not df_score.empty and 'Team' in df_score.columns:
             cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
-            if 'Team' in df_score.columns:
-                df_form = df_score[cols].copy()
+            df_form = df_score[cols].copy()
     except: pass
 
-    # 5. Dashboard
-    df_dash = fetch_csv(SHEET_URLS["dashboard"], "Team")
+    # 5. Dashboard (Read RAW without headers to preserve row indices)
+    df_dash = fetch_csv(SHEET_URLS["dashboard"], header_mode=None)
 
     return df_main, df_form, df_fix, df_chips, df_dash
 
@@ -155,7 +182,7 @@ def get_fixture_raw(team_code, gw, df_fix):
 
 # --- APP START ---
 
-with st.spinner("Loading QFPL data..."):
+with st.spinner("Loading data..."):
     df, df_form, df_fix, df_used_chips, df_dashboard = load_data_bundle()
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
@@ -196,20 +223,31 @@ if st.session_state.page == 'home':
 # ==========================================
 elif st.session_state.page == 'scores':
     st.button("← Back", on_click=go, args=('home',))
-    st.header("📊 Live Scores")
+    st.header("📊 Live Scores Dashboard")
     
     if df_dashboard.empty:
         st.warning("Dashboard data unavailable.")
     else:
-        df_dash = df_dashboard.dropna(axis=1, how='all').dropna(axis=0, how='all')
-        hl_team = st.selectbox("Highlight Team", ["None"] + teams_list)
-        
-        def highlight_team(row):
-            if hl_team != "None" and row.astype(str).str.contains(hl_team, case=False).any():
-                return ['color: #09AB3B; font-weight: bold'] * len(row)
-            return [''] * len(row)
-        
-        st.dataframe(df_dash.style.apply(highlight_team, axis=1), use_container_width=True, hide_index=True)
+        # Extract C30:H49 (Indices: Row 29-49, Col 2-8)
+        # Note: We use safe slicing in case the sheet is smaller
+        try:
+            # Slicing: Rows 29 to 49 (20 rows), Cols 2 to 8 (C, D, E, F, G, H)
+            subset = df_dashboard.iloc[29:49, 2:8].copy()
+            
+            # Reset Index and clean headers if possible
+            subset.reset_index(drop=True, inplace=True)
+            
+            # Rename columns manually for clarity (optional, based on your screenshot structure)
+            # Assuming: HomeTeam | Score | vs | Score | AwayTeam | Status?
+            subset.columns = ["Home Team", "H_Score", "vs", "A_Score", "Away Team", "Info"]
+            
+            # Styling for visibility
+            st.dataframe(subset, use_container_width=True, hide_index=True)
+            
+        except Exception as e:
+            st.error(f"Error parsing dashboard grid: {e}")
+            # Fallback: Show raw
+            st.dataframe(df_dashboard.head(50), use_container_width=True)
 
 # ==========================================
 # PAGE: DIFFERENTIALS
@@ -223,6 +261,7 @@ elif st.session_state.page == 'diff':
     with c2: gw = st.number_input("Gameweek", 1, 38, current_gw)
 
     if st.button("Calculate", type="primary"):
+        track_event("Diffx", t_a, "Calc", f"GW{gw}")
         phase = get_phase(gw)
         if not phase:
             st.error(f"GW{gw} is not in a QFPL Phase.")
@@ -243,10 +282,8 @@ elif st.session_state.page == 'diff':
                         h = {}
                         active = df[(df['Team'] == tm) & (df[phase].astype(str).str.upper().isin(['S','C']))]
                         total = len(active)
-                        count = 0
                         for i, (_, r) in enumerate(active.iterrows()):
-                            count+=1
-                            if total > 0: prog.progress(int((count)/total * 50), f"Loading {tm}...")
+                            if total > 0: prog.progress(int((i+1)/total * 50), f"Loading {tm}...")
                             mul = 2 if str(r[phase]).upper() == 'C' else 1
                             for p in get_picks(r['FPL_ID'], fetch_gw): h[p] = h.get(p, 0) + mul
                         return h
@@ -284,70 +321,61 @@ elif st.session_state.page == 'help':
     with c2: n_ph = st.selectbox("Submission Phase", [4, 5, 6, 7])
 
     if st.button("Analyze", type="primary"):
+        track_event("Lineup", my_team, "Check", f"Phase {n_ph}")
         data = []
         team_rows = df[df['Team'] == my_team]
         
-        # Calculate Remaining Phases (Current Submission + Future)
-        # Total Phases = 7. 
-        # If submitting for Phase 5, phases 5, 6, 7 are available (3 left).
         phases_remaining = 8 - n_ph
         
         for _, r in team_rows.iterrows():
-            # 1. Bench Streak
+            # Bench Streak
             p1, p2 = str(n_ph - 1), str(n_ph - 2)
             must = False
             if p1 in df.columns and p2 in df.columns:
                 if str(r[p1]).upper() == 'B' and str(r[p2]).upper() == 'B': must = True
             
-            # 2. Captaincy Check
+            # Captaincy
             used_cap = False
             for i in range(1, n_ph):
                 if str(i) in df.columns and str(r[str(i)]).upper() == 'C': used_cap = True
             
-            # 3. Mandatory Selections (Quota of 3 starts total)
+            # Quota
             past_starts = 0
             for i in range(1, n_ph):
                 if str(i) in df.columns and str(r[str(i)]).upper() in ['S', 'C']:
                     past_starts += 1
             
             starts_needed = max(0, 3 - past_starts)
-            
-            # Status Logic
             quota_status = f"Need {starts_needed} more"
-            is_critical_quota = False
+            is_critical = False
             
-            if starts_needed == 0:
-                quota_status = "Quota Met ✅"
-            elif starts_needed > phases_remaining:
+            if starts_needed == 0: quota_status = "Quota Met ✅"
+            elif starts_needed > phases_remaining: 
                 quota_status = f"IMPOSSIBLE 🚨 ({starts_needed} needed in {phases_remaining} left)"
-                is_critical_quota = True
+                is_critical = True
             elif starts_needed == phases_remaining:
-                quota_status = f"MUST SELECT ⚠️ (Need {starts_needed}/{phases_remaining})"
-                is_critical_quota = True
+                quota_status = f"MUST SELECT ⚠️"
+                is_critical = True
                 
             data.append({
                 "Player": r['Player'],
                 "Bench Status": "MUST START" if must else "OK",
                 "Captaincy": "Used" if used_cap else "Available",
                 "Min Selections": quota_status,
-                "_sort": 0 if must or is_critical_quota else 1
+                "_sort": 0 if must or is_critical else 1
             })
         
         df_out = pd.DataFrame(data).sort_values(by=['_sort', 'Player'])
-        if any(df_out['_sort']==0): st.error("🚨 Must Start violations found!")
+        if any(df_out['_sort']==0): st.error("🚨 Violations found!")
         
         def style_lineup(row):
             styles = []
             for col in row.index:
                 txt = str(row[col])
-                if "MUST" in txt or "IMPOSSIBLE" in txt:
-                    styles.append('color: #FF4B4B; font-weight: bold')
-                elif "Used" in txt:
-                    styles.append('color: #FFA500; font-weight: bold')
-                elif "Quota Met" in txt:
-                    styles.append('color: #09AB3B')
-                else:
-                    styles.append('')
+                if "MUST" in txt or "IMPOSSIBLE" in txt: styles.append('color: #FF4B4B; font-weight: bold')
+                elif "Used" in txt: styles.append('color: #FFA500; font-weight: bold')
+                elif "Quota Met" in txt: styles.append('color: #09AB3B')
+                else: styles.append('')
             return styles
 
         st.dataframe(
@@ -368,11 +396,12 @@ elif st.session_state.page == 'chip':
     with c2: next_gw = st.number_input("Upcoming Gameweek", 1, 38, current_gw+1)
 
     if st.button("Check Eligibility", type="primary"):
+        track_event("Chips", team, "Check", f"GW{next_gw}")
+        
         cols = df_used_chips.columns
         c_chip = next((c for c in cols if "Chip" in c), None)
         c_status = next((c for c in cols if "Status" in c), None)
         
-        # Phase Limits
         curr_phase = get_phase(next_gw)
         chips_used_in_phase = 0
         if curr_phase and not df_used_chips.empty:
@@ -382,7 +411,6 @@ elif st.session_state.page == 'chip':
                 t_mask = df_used_chips['CleanTeam'].str.contains(team, case=False)
                 s_mask = df_used_chips[c_status] == 'Valid'
                 c_mask = df_used_chips[c_chip] != 'Red Hot Form'
-                
                 sub = df_used_chips[t_mask & s_mask & c_mask].copy()
                 chips_used_in_phase = len(sub[(sub['GW_Int'] >= s) & (sub['GW_Int'] <= e)])
             except: pass
@@ -418,7 +446,6 @@ elif st.session_state.page == 'chip':
             comment = "Ready."
             color = "green"
 
-            # 1. Usage
             if not is_rhf and used:
                 res.append({"Chip Name": c_name, "Availability": "No", "Can be Played?": "No", "Comments": "Already played.", "_c": "grey"})
                 continue
@@ -427,7 +454,6 @@ elif st.session_state.page == 'chip':
                 res.append({"Chip Name": c_name, "Availability": "Yes", "Can be Played?": "No", "Comments": f"Phase limit ({chips_used_in_phase}/2 used).", "_c": "red"})
                 continue
 
-            # 2. RHF Logic
             if is_rhf:
                 gap = next_gw - last_rhf_gw
                 if gap <= 4:
@@ -441,15 +467,12 @@ elif st.session_state.page == 'chip':
                                 if str(g) in t_row.columns:
                                     val = str(t_row[str(g)].values[0]).upper()
                                     if val in ['W','L','D']: last_4.append(val)
-                            
-                            # Streak Check
                             if last_4 != ['W']*4:
                                 can_play = "No"; comment = f"Form: {last_4} (Need 4 Wins)"; color = "red"
                         else:
                             can_play = "No"; comment = "Form unavailable."; color = "red"
                     except: pass
 
-            # 3. Stay Humble
             elif c_name == "Stay Humble":
                 try:
                     raw_opp = get_fixture_raw(team, next_gw, df_fix)
@@ -468,7 +491,6 @@ elif st.session_state.page == 'chip':
                             can_play = "No"; comment = f"Must play vs team you lost to (vs {opp_code})."; color = "red"
                 except: pass
             
-            # 4. Travelling Support
             elif c_name == "Travelling Support":
                 raw_fix = get_fixture_raw(team, next_gw, df_fix)
                 if raw_fix and raw_fix.isupper():
@@ -491,4 +513,4 @@ elif st.session_state.page == 'chip':
             use_container_width=True, hide_index=True
         )
     st.divider()
-    st.link_button("🍟 Submit Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform")
+    st.link_button("🍟 Submit Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform", type="primary")
