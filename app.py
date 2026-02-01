@@ -24,41 +24,10 @@ SHEET_URLS = {
     "dashboard": "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMx7WNVySFfJuAjKyc5PvPnL5XAz9FzLbIXFL5qjqwt4_YCJmuNax_jMsfxnRXoekHKQzFmYUu5YEM/pub?gid=0&single=true&output=csv"
 }
 
-# B. ANALYTICS CONFIG (Safe Mode)
-ANALYTICS = {
-    "enabled": True, # Enabled but will fail silently if URL is invalid
-    "form_url": "PASTE_GOOGLE_FORM_RESPONSE_URL_HERE", 
-    "entries": {
-        "page": "entry.XXXXXX",
-        "team": "entry.XXXXXX",
-        "action": "entry.XXXXXX",
-        "details": "entry.XXXXXX"
-    }
-}
-
-# --- FUNCTIONS ---
-
-def track_event(page, team, action, details=""):
-    """Silently logs events to Google Forms."""
-    if not ANALYTICS["enabled"] or "PASTE" in ANALYTICS["form_url"]:
-        return
-    try:
-        data = {
-            ANALYTICS["entries"]["page"]: str(page),
-            ANALYTICS["entries"]["team"]: str(team),
-            ANALYTICS["entries"]["action"]: str(action),
-            ANALYTICS["entries"]["details"]: str(details)
-        }
-        requests.post(ANALYTICS["form_url"], data=data, timeout=1)
-    except: pass
+# --- DATA LOADING FUNCTIONS ---
 
 @st.cache_data(ttl=600)
 def fetch_csv(url, key_col=None, header_mode='infer'):
-    """
-    Fetches CSV data. 
-    header_mode='infer' uses auto detection. 
-    header_mode=None reads raw grid (good for dashboards).
-    """
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -68,10 +37,8 @@ def fetch_csv(url, key_col=None, header_mode='infer'):
             # Read raw grid without assuming headers
             return pd.read_csv(io.StringIO(content), header=None)
         
-        # Standard Read
         df = pd.read_csv(io.StringIO(content))
         
-        # Smart Header Search
         if key_col:
             cols_lower = [str(c).lower() for c in df.columns]
             if key_col.lower() not in cols_lower:
@@ -129,12 +96,22 @@ def load_data_bundle():
     df_score = fetch_csv(SHEET_URLS["scoring"], "FORM")
     df_form = pd.DataFrame()
     try:
-        if not df_score.empty and 'Team' in df_score.columns:
+        response = requests.get(SHEET_URLS["scoring"])
+        content = response.content.decode('utf-8')
+        lines = content.splitlines()
+        header_row = None
+        for i, line in enumerate(lines):
+            if "Team" in line and ",1," in line and ",2," in line:
+                header_row = i; break
+        
+        if header_row is not None:
+            df_score = pd.read_csv(io.StringIO(content), header=header_row)
             cols = ['Team'] + [str(i) for i in range(1, 39) if str(i) in df_score.columns]
-            df_form = df_score[cols].copy()
+            if 'Team' in df_score.columns:
+                df_form = df_score[cols].copy()
     except: pass
 
-    # 5. Dashboard (Read RAW without headers to preserve row indices)
+    # 5. Dashboard (Read Raw)
     df_dash = fetch_csv(SHEET_URLS["dashboard"], header_mode=None)
 
     return df_main, df_form, df_fix, df_chips, df_dash
@@ -182,17 +159,16 @@ def get_fixture_raw(team_code, gw, df_fix):
 
 # --- APP START ---
 
-with st.spinner("Loading data..."):
+with st.spinner("Loading QFPL data..."):
     df, df_form, df_fix, df_used_chips, df_dashboard = load_data_bundle()
     fpl_elements, fpl_teams, current_gw = get_fpl_metadata()
 
 if df.empty:
-    st.error("Critical Data Missing. Check 'lineups' link.")
+    st.error("Critical Data Missing.")
     st.stop()
 
 teams_list = sorted([t for t in df['Team'].dropna().unique().tolist() if len(str(t)) > 1])
 
-# Navigation
 if 'page' not in st.session_state: st.session_state.page = 'home'
 def go(p): st.session_state.page = p
 
@@ -219,35 +195,59 @@ if st.session_state.page == 'home':
         st.button("Chip Helper", on_click=go, args=('chip',), use_container_width=True)
 
 # ==========================================
-# PAGE: LIVE SCORES
+# PAGE: LIVE SCORES (CLEAN & COLORED)
 # ==========================================
 elif st.session_state.page == 'scores':
     st.button("← Back", on_click=go, args=('home',))
-    st.header("📊 Live Scores Dashboard")
+    st.header("📊 Live Scores")
     
     if df_dashboard.empty:
         st.warning("Dashboard data unavailable.")
     else:
-        # Extract C30:H49 (Indices: Row 29-49, Col 2-8)
-        # Note: We use safe slicing in case the sheet is smaller
         try:
-            # Slicing: Rows 29 to 49 (20 rows), Cols 2 to 8 (C, D, E, F, G, H)
+            # 1. Slice exact grid (C30:H49 -> indices 29:49, cols 2:8)
             subset = df_dashboard.iloc[29:49, 2:8].copy()
-            
-            # Reset Index and clean headers if possible
             subset.reset_index(drop=True, inplace=True)
+            subset.columns = ["Home Team", "Home Score", "vs", "Away Score", "Away Team", "Status"]
             
-            # Rename columns manually for clarity (optional, based on your screenshot structure)
-            # Assuming: HomeTeam | Score | vs | Score | AwayTeam | Status?
-            subset.columns = ["Home Team", "H_Score", "vs", "A_Score", "Away Team", "Info"]
+            # 2. Drop empty rows (The blank rows in the sheet)
+            subset = subset.dropna(subset=['Home Team'])
             
-            # Styling for visibility
-            st.dataframe(subset, use_container_width=True, hide_index=True)
+            # 3. Styling Function (Logic: Win >= 6, Loss <= -6, Draw within 5)
+            def style_dashboard(row):
+                try:
+                    h_val = float(row['Home Score'])
+                    a_val = float(row['Away Score'])
+                    diff = h_val - a_val
+                    
+                    # Colors
+                    win_col = 'background-color: #d1e7dd; color: black' # Green
+                    draw_col = 'background-color: #fff3cd; color: black' # Yellow
+                    loss_col = 'background-color: #f8d7da; color: black' # Red
+                    
+                    # Home Perspective
+                    if diff >= 6: h_style = win_col
+                    elif diff <= -6: h_style = loss_col
+                    else: h_style = draw_col
+                    
+                    # Away Perspective (Inverse of Home)
+                    if diff <= -6: a_style = win_col # Away wins if diff is negative
+                    elif diff >= 6: a_style = loss_col
+                    else: a_style = draw_col
+                    
+                    # Default
+                    def_style = ''
+                    
+                    return [h_style, h_style, def_style, a_style, a_style, def_style]
+                except:
+                    # If scores are not numbers (e.g. empty or text), return no style
+                    return [''] * 6
+
+            # Apply style and display
+            st.dataframe(subset.style.apply(style_dashboard, axis=1), use_container_width=True, hide_index=True)
             
         except Exception as e:
-            st.error(f"Error parsing dashboard grid: {e}")
-            # Fallback: Show raw
-            st.dataframe(df_dashboard.head(50), use_container_width=True)
+            st.error(f"Error parsing dashboard: {e}")
 
 # ==========================================
 # PAGE: DIFFERENTIALS
@@ -261,7 +261,6 @@ elif st.session_state.page == 'diff':
     with c2: gw = st.number_input("Gameweek", 1, 38, current_gw)
 
     if st.button("Calculate", type="primary"):
-        track_event("Diffx", t_a, "Calc", f"GW{gw}")
         phase = get_phase(gw)
         if not phase:
             st.error(f"GW{gw} is not in a QFPL Phase.")
@@ -282,8 +281,10 @@ elif st.session_state.page == 'diff':
                         h = {}
                         active = df[(df['Team'] == tm) & (df[phase].astype(str).str.upper().isin(['S','C']))]
                         total = len(active)
+                        count = 0
                         for i, (_, r) in enumerate(active.iterrows()):
-                            if total > 0: prog.progress(int((i+1)/total * 50), f"Loading {tm}...")
+                            count+=1
+                            if total > 0: prog.progress(int((count)/total * 50), f"Loading {tm}...")
                             mul = 2 if str(r[phase]).upper() == 'C' else 1
                             for p in get_picks(r['FPL_ID'], fetch_gw): h[p] = h.get(p, 0) + mul
                         return h
@@ -321,7 +322,6 @@ elif st.session_state.page == 'help':
     with c2: n_ph = st.selectbox("Submission Phase", [4, 5, 6, 7])
 
     if st.button("Analyze", type="primary"):
-        track_event("Lineup", my_team, "Check", f"Phase {n_ph}")
         data = []
         team_rows = df[df['Team'] == my_team]
         
@@ -396,8 +396,6 @@ elif st.session_state.page == 'chip':
     with c2: next_gw = st.number_input("Upcoming Gameweek", 1, 38, current_gw+1)
 
     if st.button("Check Eligibility", type="primary"):
-        track_event("Chips", team, "Check", f"GW{next_gw}")
-        
         cols = df_used_chips.columns
         c_chip = next((c for c in cols if "Chip" in c), None)
         c_status = next((c for c in cols if "Status" in c), None)
@@ -513,4 +511,4 @@ elif st.session_state.page == 'chip':
             use_container_width=True, hide_index=True
         )
     st.divider()
-    st.link_button("🍟 Submit Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform", type="primary")
+    st.link_button("🍟 Submit Chip", "https://docs.google.com/forms/d/e/1FAIpQLSeCOyvw4b7Ka2S19oBrhJd9SBnfCZM0Ycap-9Q8ng50hvKgcQ/viewform")
